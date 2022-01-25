@@ -1,0 +1,175 @@
+import zlib
+import json
+import boto3
+import uuid
+import base64
+from base64 import b64decode
+import sys
+import os
+import requests
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
+from googleapiclient.errors import HttpError
+
+from email.mime.text import MIMEText
+
+channel = os.environ['CHANNEL']
+
+SCOPES = [
+    'https://www.googleapis.com/auth/admin.directory.user',
+    'https://www.googleapis.com/auth/gmail.send'
+]
+
+
+def lambda_handler(event, context):
+    parsed_event = json.loads(event)
+
+    compressed_json = parsed_event['base64(zip(o))']
+
+    newHires = json.loads(zlib.decompress(b64decode(compressed_json)))
+
+    print(newHires)
+
+    SERVICE_ACCOUNT_FILE = getParameter('gsuite')
+
+    creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+
+    admin_service = build('admin', 'directory_v1',
+                          credentials=creds.with_subject(SERVICE_ACCOUNT_FILE['assumed_subject_email']))
+
+    gmail_service = build('gmail', 'v1', credentials=creds.with_subject(SERVICE_ACCOUNT_FILE['assumed_subject_email']))
+
+    sendSlackMessage("\n:robot_face:`Processing...`:robot_face:\n")
+
+    slack_msg = "\n"
+
+    accountSuccess = []
+    for newHire in newHires:
+        print('Starting process for ' + newHire["workEmail"])
+        accountSuccess.append(newHire["id"])
+
+        password, info = createAccountInfo(newHire)
+        message = createMessage(newHire, password)
+
+        try:
+            admin_service.users().insert(body=info).execute()
+            slack_msg = slack_msg + "Account successfully created for " + newHire["workEmail"] + "\n"
+
+            if newHire['homeEmail']:
+                gmail_service.users().messages().send(userId='me', body=message).execute()
+                slack_msg = slack_msg + "Welcome Email sent to " + newHire['homeEmail'] + "\n"
+            else:
+                slack_msg = slack_msg + "No personal email listed :crying:\n"
+        except HttpError as error:
+            if error.resp.status == 409:
+                slack_msg = slack_msg + newHire["workEmail"] + " already exists. :yougotitdude: \n"
+            else:
+                slack_msg = slack_msg + ":warning: Something went wrong with " + newHire["workEmail"] + "\n"
+        except:  # catch *all* exceptions
+            e = sys.exc_info()[0]
+            print(e)
+
+    if len(accountSuccess) > 0:
+        callEmployeeSync(accountSuccess)
+
+    if len(slack_msg) > 2:
+        sendSlackMessage(slack_msg)
+    else:
+        sendSlackMessage("Something went wrong.. :shit:")
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('No new accounts found.')
+    }
+
+
+def callEmployeeSync(employees):
+    payload = {
+        "source": f"employeeSyncCLI",
+        "bamboo_id": f"--newHires {','.join(employees)}",
+        "action": "retry"
+    }
+
+    payload = {**payload, **_get_caller_metadata()}
+
+    try:
+        lambda_response = boto3.client('lambda', region_name='us-east-1').invoke(
+            FunctionName='directory-sync-prod-syncRunner',
+            InvocationType='Event',
+            LogType='None',
+            Payload=bytes(json.dumps(payload), encoding='utf-8')
+        )
+
+        if lambda_response["ResponseMetadata"]["HTTPStatusCode"] != 202:
+            message = "Unable to sent this request. "
+            print(message)
+
+        print(f"Invoked the Employee Sync for the following new hires: {employees}")
+
+    except Exception as ex:
+        template = "An exception of type {0} occurred. Arguments:\n{1!r}"
+        message = template.format(type(ex).__name__, ex.args)
+        print(message)
+
+
+def createAccountInfo(newHire):
+    random_string = str(uuid.uuid4()).split('-')
+    password = random_string[0]
+
+    info = {
+        "primaryEmail": newHire["workEmail"],
+        "name": {
+            "givenName": newHire["firstName"],
+            "familyName": newHire["lastName"],
+        },
+        "password": password,
+        "changePasswordAtNextLogin": True
+    }
+
+    return password, info
+
+
+def createMessage(newHire, password):
+    preferredName = newHire["firstName"]
+
+    message_text = 'Welcome Email'
+
+    message = MIMEText(message_text, 'html')
+    message['to'] = newHire['homeEmail']
+    message['from'] = "tech@auth0.com"
+    message['bcc'] = "tech@auth0.com"
+    message['subject'] = "Welcome to Auth0!"
+
+    message = message.as_string()
+    message_bytes = message.encode('ascii')
+    base64_bytes = base64.b64encode(message_bytes)
+    base64_str = base64_bytes.decode('ascii')
+
+    return {'raw': base64_str}
+
+
+def sendSlackMessage(message):
+    slack_app = getParameter("/slackbot_NewHireWorkdayAssistant/slack_app")
+
+    data = {
+        'token': slack_app["token"],
+        'channel': channel,
+        'text': message,
+    }
+
+    requests.post(url='https://slack.com/api/chat.postMessage', data=data)
+
+
+def getParameter(param_name):
+    session = boto3.Session(region_name='us-west-2')
+    ssm = session.client('ssm')
+    response = ssm.get_parameter(Name=param_name, WithDecryption=True)
+    service_credentials = response['Parameter']['Value']
+
+    return json.loads(service_credentials)
+
+def _get_caller_metadata() -> dict:
+    """Retrieves user's ARN and returns in a dictionary"""
+    sts = boto3.client('sts')
+    identity = sts.get_caller_identity()
+    return {"callerArn": identity['Arn']}
