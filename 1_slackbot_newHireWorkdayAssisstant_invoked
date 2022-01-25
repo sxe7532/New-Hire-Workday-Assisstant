@@ -10,7 +10,7 @@ import os
 
 SNS_TOPIC_ARN = 'arn:aws:sns:us-west-2:xxx:slackbot_NewHireWorkdayAssistant_ApprovalRequest'
 
-CHANNEL_ID="C01U8UUFDB6"
+CHANNEL_ID="xxx"
 
 def lambda_handler(event, context):
     request_body = event["body"]
