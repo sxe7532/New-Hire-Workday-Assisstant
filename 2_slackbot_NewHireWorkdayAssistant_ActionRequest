@@ -1,0 +1,89 @@
+import json
+import hashlib
+import hmac
+import boto3
+from botocore.exceptions import ClientError
+import base64
+from urllib import parse as urlparse
+import time
+import requests
+
+
+def lambda_handler(event, context):
+    response_json = {}
+    request_body = event["body"]
+    request_body_parsed = dict(urlparse.parse_qsl(request_body))
+
+    json_slack_data = json.loads(request_body_parsed["payload"])
+
+    channel_id = json_slack_data["channel"]["id"]
+    
+    if (channel_id == "xxx"):
+        
+        delivered_signature = event["headers"]['X-Slack-Signature']
+
+        slack_request_timestamp = event["headers"]['X-Slack-Request-Timestamp']
+
+        slack_app = getParameter("/slackbot_NewHireWorkdayAssistant/slack_app")
+        slack_signing_secret = slack_app["signing_secret"]
+        
+        basestring = f"v0:{slack_request_timestamp}:{request_body}".encode('utf-8')
+        
+        slack_signing_secret = bytes(slack_signing_secret, 'utf-8')
+        expected_signature = 'v0=' + hmac.new(slack_signing_secret, basestring, hashlib.sha256).hexdigest()
+        
+        if hmac.compare_digest(expected_signature, delivered_signature):    
+            actions = json_slack_data["actions"][0]
+    
+            if actions["name"] == "Yes":
+                response_json["text"] = "Approved by *" + json_slack_data["user"]["name"] + "*"
+                response_json["attachments"] = [{ "text": ":excellent-burns: We have new Auziros! :auth0:\n" + json_slack_data["original_message"]["attachments"][0]["text"]}]
+                print("Approved by "+ json_slack_data["user"]["name"])
+                
+                try:
+                    print(actions["value"])
+                    
+                    lambda_response = boto3.client('lambda', ).invoke(
+                        FunctionName='slackbot_NewHireWorkdayAssistant_ExecutionRequest',
+                        InvocationType='Event',
+                        Payload=bytes(json.dumps(actions["value"]), encoding='utf-8')
+                    )
+
+                    
+                    print(lambda_response["ResponseMetadata"]["HTTPStatusCode"])
+            
+                    if lambda_response["ResponseMetadata"]["HTTPStatusCode"] != 202:
+            
+                        response_text = "Unable to sent this request.:sadparrot: "
+                        response_json["text"] = response_text
+            
+                except Exception as ex:
+                    template = "An exception of type {0} occurred. Arguments:\n{1!r}"
+                    message = template.format(type(ex).__name__, ex.args)
+                    print(message)
+                    response_text = message
+                    response_json["text"] = response_text
+
+            else:
+                response_json["text"] = "Rejected by *" + json_slack_data["user"]["name"] + "*"
+                response_json["attachments"] = [{ "text": ":excellent-burns: We have new Auziros! :auth0:\n" + json_slack_data["original_message"]["attachments"][0]["text"]}]
+                print("Rejected by "+ json_slack_data["user"]["name"])
+                
+    else:
+        response_json["text"] = ":warning: Request came from an unauthorized channel."
+        # Returning status code of 200 so that response text is presented to user
+        
+    return {
+        'statusCode': 200,
+        'body': json.dumps(response_json)
+    }
+    
+def getParameter(param_name):
+    session = boto3.Session(region_name='us-west-2')
+    ssm = session.client('ssm')
+    response = ssm.get_parameter(Name=param_name, WithDecryption=True)
+    service_credentials = response['Parameter']['Value']
+
+    return json.loads(service_credentials)
+
+
