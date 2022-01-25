@@ -136,9 +136,9 @@ def createMessage(newHire, password):
 
     message = MIMEText(message_text, 'html')
     message['to'] = newHire['homeEmail']
-    message['from'] = "tech@auth0.com"
-    message['bcc'] = "tech@auth0.com"
-    message['subject'] = "Welcome to Auth0!"
+    message['from'] = "tech@company.com"
+    message['bcc'] = "tech@company.com"
+    message['subject'] = "Welcome to Company!"
 
     message = message.as_string()
     message_bytes = message.encode('ascii')
