@@ -1,0 +1,209 @@
+import requests
+import json
+import xmltodict
+from requests.auth import HTTPBasicAuth
+import boto3
+from datetime import datetime, timedelta
+import zlib
+import base64
+import re
+
+channel= "#private-it-automations"
+username = 'New Hire Assistant Bot'
+
+ZIPJSON_KEY = 'base64(zip(o))'
+
+def lambda_handler(event, context):
+    creds = getParameter("us-east-1", "/directory-sync-prod/workday")
+    records = event.get("Records")
+    accountsToCreate = []
+    employees = get_employees(creds)
+    
+    if records and "Sns" in records[0]:
+        data_from_slack = event["Records"][0]["Sns"]["Message"]
+    
+        json_loaded_data = json.loads(data_from_slack)
+        text = json_loaded_data["text"]
+        
+        if "--check" in text:
+            accountsToCreate = calculateStartDate(employees, records)
+
+        if "--welcome" in text:
+            employee_id = text.replace("--welcome ", "")
+            accountsToCreate = get_employee_by_id(employee_id, creds)
+    else:
+        accountsToCreate = calculateStartDate(employees, records)
+    
+    if accountsToCreate is not None and len(accountsToCreate) > 0:
+        print(f"Found {len(accountsToCreate)} new hires")
+        createSlackApprovalMessage(accountsToCreate)
+    elif records is not None and "Sns" in records[0]:
+        sendSlackMessage("No new accounts to create. :blobsip:")
+    
+    return 
+    
+def get_employee_by_id(employee_id, creds):
+    
+    print(f"Getting employee by ID: {employee_id}")
+    url = f"{creds['web_service_url']}id={employee_id}&format=json"
+    
+    request_response = requests.get(url,
+                                headers={'Accept': 'application/json', 'Content-type': 'application/json'},
+                                auth=HTTPBasicAuth(creds["username"], creds["password"]))
+
+    workday_report = request_response.json()
+    
+    data = workday_report["Report_Entry"]
+
+    if not data or data[0]["id"] != employee_id:
+        return None
+    else:
+        employee = {
+            'id': data[0]['id'] if 'id' in data[0] else None,
+            'firstName': data[0]['firstName'] if 'firstName' in data[0] else None,
+            'lastName': data[0]['lastName'] if 'lastName' in data[0] else None,
+            'hireDate': data[0]['hireDate'] if 'hireDate' in data[0] else None,
+            'homeEmail': data[0]['homeEmail'] if 'homeEmail' in data[0] else None,
+            'workEmail': data[0]['workEmail'] if 'workEmail' in data[0] else None
+        }
+        
+        return [employee]
+    
+def get_employees(creds):
+    
+    url = f"{creds['web_service_url']}&format=json"
+
+    request_response = requests.get(url,
+                                headers={'Accept': 'application/json', 'Content-type': 'application/json'},
+                                auth=HTTPBasicAuth(creds["username"], creds["password"]))
+
+    workday_report = request_response.json()
+    
+    data = []
+    for wd_record in workday_report["Report_Entry"]:
+        employee = {
+            'id': wd_record['id'] if 'id' in wd_record else None,
+            'firstName': wd_record['firstName'] if 'firstName' in wd_record else None,
+            'lastName': wd_record['lastName'] if 'lastName' in wd_record else None,
+            'hireDate': wd_record['hireDate'] if 'hireDate' in wd_record else None,
+            'homeEmail': wd_record['homeEmail'] if 'homeEmail' in wd_record else None,
+            'workEmail': wd_record['workEmail'] if 'workEmail' in wd_record else None
+        }
+
+        data.append(employee)
+    
+    if len(data) > 0:
+        return data
+    return None
+    
+def calculateStartDate(employees, records):
+    accountsToCreate = []
+    today = datetime.today() - timedelta(hours=8)
+
+    for employee in employees:
+        if employee['hireDate'] is not None:
+                hireDate = datetime.strptime(employee['hireDate'], '%Y-%m-%d')
+                
+                secondsBeforestartDate = (today - hireDate).total_seconds() 
+                
+                hoursBeforestartDate = divmod(secondsBeforestartDate, 3600)[0]
+        
+                if hoursBeforestartDate <= 0 and hoursBeforestartDate >= -23:
+                    print(str(hoursBeforestartDate) + " hours before start.")
+                    
+                    print(employee)
+                    
+                    accountsToCreate.append(employee)
+                elif records is not None and "Sns" in records[0]:
+                    if hoursBeforestartDate <= 23 and hoursBeforestartDate >= 0:
+                        print(employee)
+                        print(str(hoursBeforestartDate) + " hours before start.")
+                        accountsToCreate.append(employee)
+                  
+    return accountsToCreate
+    
+def createSlackApprovalMessage(accountsToCreate):
+
+    output_message = ""
+    
+    for account in accountsToCreate:
+        if account['workEmail'] is not None:
+            output_message = f"{output_message} {account['workEmail']}\n"
+        else:
+            output_message = f":warning: {output_message} *{account['firstName']} {account['lastName']}* has no workEmail set on Workday\n"
+    
+    accountsToCreate = json_zip(accountsToCreate)
+    
+    attachments = json.dumps([
+       {
+           "text": "Do you want me to create the following accounts?\n" + output_message,
+           "fallback": "You are unable to create accounts",
+           "callback_id": "create_accounts",
+           "color": "#3AA3E3",
+           "attachment_type": "default",
+           "actions": [
+               {
+                   "name": "Yes",
+                   "text": "Yes, create accounts",
+                   "style": "primary",
+                   "type": "button",
+                   "value": json.dumps(accountsToCreate)
+               },
+               {
+                   "name": "No",
+                   "text": "No",
+                   "type": "button",
+                   "style": "danger",
+                   "value": "no",
+                   "confirm": {
+                     "title": "Please confirm: ",
+                     "text": "Are you sure you don't want me to create these accounts?",
+                     "ok_text": "Yes",
+                     "dismiss_text": "No"
+                   }
+               }
+           ]
+       }
+    ])
+    
+    sendSlackMessage(":excellent-burns: We have new Authziros! :auth0:", attachments)
+    
+def sendSlackMessage(message, attachments = None):
+    
+    slack_app = getParameter("us-west-2", "/slackbot_NewHireWorkdayAssistant/slack_app")
+
+    data = {
+        'token': slack_app["token"],
+        'channel': channel,    
+        'text': message,
+        'attachments' : attachments,
+    }
+
+    response_test = requests.post(url='https://slack.com/api/chat.postMessage', data=data)
+    
+    print(response_test.json())
+    
+def json_zip(j):
+
+    j = {
+        ZIPJSON_KEY: base64.b64encode(
+            zlib.compress(
+                json.dumps(j).encode('utf-8')
+            )
+        ).decode('ascii')
+    }
+
+    return j
+    
+def getParameter(region, param_name):
+    session = boto3.Session(region_name= region)
+    ssm = session.client('ssm')
+    response = ssm.get_parameter(Name=param_name, WithDecryption=True)
+    service_credentials = response['Parameter']['Value']
+
+    return json.loads(service_credentials)
+
+
+    
+
+
