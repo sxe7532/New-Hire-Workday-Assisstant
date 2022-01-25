@@ -1,0 +1,79 @@
+import json
+import hashlib
+import hmac
+import boto3
+from botocore.exceptions import ClientError
+import base64
+from urllib import parse as urlparse
+import time
+import os
+
+SNS_TOPIC_ARN = 'arn:aws:sns:us-west-2:xxx:slackbot_NewHireWorkdayAssistant_ApprovalRequest'
+
+CHANNEL_ID="C01U8UUFDB6"
+
+def lambda_handler(event, context):
+    request_body = event["body"]
+    request_body_parsed = dict(urlparse.parse_qsl(request_body))
+
+    
+    channel_id = request_body_parsed["channel_id"]
+    
+    if (channel_id == CHANNEL_ID):
+        
+        delivered_signature = event["headers"]['X-Slack-Signature']
+
+        slack_request_timestamp = event["headers"]['X-Slack-Request-Timestamp']
+
+        slack_app = getParameter("/slackbot_NewHireWorkdayAssistant/slack_app")
+        slack_signing_secret = slack_app["signing_secret"]
+        
+        basestring = f"v0:{slack_request_timestamp}:{request_body}".encode('utf-8')
+        
+        slack_signing_secret = bytes(slack_signing_secret, 'utf-8')
+        expected_signature = 'v0=' + hmac.new(slack_signing_secret, basestring, hashlib.sha256).hexdigest()
+            
+        current_time = time.time()
+        slack_request_timestamp_asFloat = float(slack_request_timestamp)
+        if (current_time - slack_request_timestamp_asFloat) > 300:
+            response_text = "Message more than 5 minutes old"
+            response_code = 412
+        # Confirm that delivered signature is the same as the expected_signature
+        elif hmac.compare_digest(expected_signature, delivered_signature):
+            try: 
+                search_string = request_body_parsed["text"]
+            except KeyError:
+        	    # catches if no search string parameter is provided
+                search_string = ""
+            # hooray, signature strings match, the request came from Slack!
+            if search_string == "":
+                response_text = ":information_source: Choose a parameter: `--check` or `--welcome <id>`."
+                # Returning status code of 200 so that response text is presented to user
+                response_code = 200
+            else:
+                response_text = "Checking for new hire(s) :mag:.. "
+                response_code = 200
+                # Publish to the SNS topic
+                client = boto3.client('sns')
+                trigger = client.publish(TargetArn = SNS_TOPIC_ARN,Message=json.dumps({'default': json.dumps(request_body_parsed)}),MessageStructure='json') 
+        else:
+            response_text = "Message signature is invalid"
+            response_code = 412
+    else:
+        response_text = ":warning: You must use `/newhire` while inside an authorized channel."
+        # Returning status code of 200 so that response text is presented to user
+        response_code = 200
+    
+    # TODO implement
+    return {
+        'statusCode': 200,
+        'body': response_text
+    }
+
+def getParameter(param_name):
+    session = boto3.Session(region_name='us-west-2')
+    ssm = session.client('ssm')
+    response = ssm.get_parameter(Name=param_name, WithDecryption=True)
+    service_credentials = response['Parameter']['Value']
+
+    return json.loads(service_credentials)
